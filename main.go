@@ -2,15 +2,22 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"slices"
+	"sort"
+	"strconv"
 	"strings"
 	"text/template"
+
+	"github.com/mloughton/chirpy/internal/database"
 )
 
 type apiConfig struct {
+	db             *database.DB
 	fileserverHits int
 }
 
@@ -75,47 +82,115 @@ func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
 	w.Write(responseJSON)
 }
 
-type chirp struct {
-	Body string `json:"body"`
-}
-
-func (c chirp) Clean() string {
+func Clean(s string) string {
 	badWords := []string{"kerfuffle", "sharbert", "fornax"}
-	bodyWords := strings.Split(c.Body, " ")
-	for i, word := range bodyWords {
+	words := strings.Split(s, " ")
+	for i, word := range words {
 		if slices.Contains[[]string](badWords, strings.ToLower(word)) {
-			bodyWords[i] = "****"
+			words[i] = "****"
 		}
 	}
-	return strings.Join(bodyWords, " ")
+	return strings.Join(words, " ")
 }
 
-func HandlePostValidateChirp(w http.ResponseWriter, r *http.Request) {
-
+func (cfg *apiConfig) HandlePostChirps(w http.ResponseWriter, r *http.Request) {
+	type request struct {
+		Body string `json:"body"`
+	}
 	decoder := json.NewDecoder(r.Body)
-	c := chirp{}
-	err := decoder.Decode(&c)
+	req := request{}
+	err := decoder.Decode(&req)
 	if err != nil {
 		log.Println(err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	if len(c.Body) > 140 {
+	if len(req.Body) > 140 {
 		respondWithError(w, http.StatusBadRequest, "Something went wrong")
 		return
 	}
 
-	type response struct {
-		CleanedBody string `json:"cleaned_body"`
+	res, err := cfg.db.CreateChirp(Clean(req.Body))
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
 	}
-	respondWithJSON(w, http.StatusOK, response{CleanedBody: c.Clean()})
+
+	respondWithJSON(w, http.StatusCreated, res)
+}
+
+func (cfg *apiConfig) HandleGetChirps(w http.ResponseWriter, r *http.Request) {
+	chirps, err := cfg.db.GetChirps()
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	sort.Slice(chirps, func(i, j int) bool {
+		return chirps[i].Id < chirps[j].Id
+	})
+	respondWithJSON(w, http.StatusOK, chirps)
+}
+
+func (cfg *apiConfig) HandleGetChirp(w http.ResponseWriter, r *http.Request) {
+	chirpId, err := strconv.Atoi(r.PathValue("chirpId"))
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	chirp, err := cfg.db.GetChirp(chirpId)
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, chirp)
+}
+
+func (cfg *apiConfig) HandlePostUsers(w http.ResponseWriter, r *http.Request) {
+	type request struct {
+		Email string `json:"email"`
+	}
+	decoder := json.NewDecoder(r.Body)
+	req := request{}
+	err := decoder.Decode(&req)
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	res, err := cfg.db.CreateUser(req.Email)
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	respondWithJSON(w, http.StatusCreated, res)
 }
 
 func main() {
-	mux := http.NewServeMux()
-	apiCfg := &apiConfig{}
 
+	dbg := flag.Bool("debug", false, "Enable debug mode")
+	flag.Parse()
+
+	if *dbg {
+		os.Remove("./database.json")
+	}
+
+	db, err := database.NewDB("./database.json")
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	apiCfg := &apiConfig{db: db}
+
+	mux := http.NewServeMux()
 	mux.Handle("/app/*", apiCfg.middlewareMetricsInc(appHandler()))
 
 	mux.HandleFunc("GET /api/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -128,7 +203,13 @@ func main() {
 
 	mux.HandleFunc("/api/reset", apiCfg.HandleResetMetrics)
 
-	mux.HandleFunc("POST /api/validate_chirp", HandlePostValidateChirp)
+	mux.HandleFunc("POST /api/chirps", apiCfg.HandlePostChirps)
+
+	mux.HandleFunc("GET /api/chirps", apiCfg.HandleGetChirps)
+
+	mux.HandleFunc("GET /api/chirps/{chirpId}", apiCfg.HandleGetChirp)
+
+	mux.HandleFunc("POST /api/users", apiCfg.HandlePostUsers)
 
 	mux.HandleFunc("GET /admin/metrics/", apiCfg.HandleGetAdminMetrics)
 
