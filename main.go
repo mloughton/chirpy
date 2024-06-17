@@ -1,9 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"slices"
+	"strings"
 	"text/template"
 )
 
@@ -50,6 +53,65 @@ func (cfg *apiConfig) HandleGetAdminMetrics(w http.ResponseWriter, r *http.Reque
 	}
 }
 
+func respondWithError(w http.ResponseWriter, code int, msg string) {
+	type response struct {
+		Error string `json:"error"`
+	}
+	responseBody := response{
+		Error: msg,
+	}
+	respondWithJSON(w, code, responseBody)
+}
+
+func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
+	responseJSON, err := json.Marshal(payload)
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	w.Write(responseJSON)
+}
+
+type chirp struct {
+	Body string `json:"body"`
+}
+
+func (c chirp) Clean() string {
+	badWords := []string{"kerfuffle", "sharbert", "fornax"}
+	bodyWords := strings.Split(c.Body, " ")
+	for i, word := range bodyWords {
+		if slices.Contains[[]string](badWords, strings.ToLower(word)) {
+			bodyWords[i] = "****"
+		}
+	}
+	return strings.Join(bodyWords, " ")
+}
+
+func HandlePostValidateChirp(w http.ResponseWriter, r *http.Request) {
+
+	decoder := json.NewDecoder(r.Body)
+	c := chirp{}
+	err := decoder.Decode(&c)
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	if len(c.Body) > 140 {
+		respondWithError(w, http.StatusBadRequest, "Something went wrong")
+		return
+	}
+
+	type response struct {
+		CleanedBody string `json:"cleaned_body"`
+	}
+	respondWithJSON(w, http.StatusOK, response{CleanedBody: c.Clean()})
+}
+
 func main() {
 	mux := http.NewServeMux()
 	apiCfg := &apiConfig{}
@@ -63,7 +125,10 @@ func main() {
 	})
 
 	mux.HandleFunc("GET /api/metrics", apiCfg.HandleGetMetrics)
+
 	mux.HandleFunc("/api/reset", apiCfg.HandleResetMetrics)
+
+	mux.HandleFunc("POST /api/validate_chirp", HandlePostValidateChirp)
 
 	mux.HandleFunc("GET /admin/metrics/", apiCfg.HandleGetAdminMetrics)
 
