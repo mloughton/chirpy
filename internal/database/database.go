@@ -1,20 +1,33 @@
 package database
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"sync"
+	"time"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 type User struct {
-	Id    int    `json:"id"`
-	Email string `json:"email"`
+	Id           int    `json:"id"`
+	Email        string `json:"email"`
+	Password     string `json:"password"`
+	IsChirpyRed  bool   `json:"is_chirpy_red"`
+	RefreshToken struct {
+		Token      string    `json:"token"`
+		Expiration time.Time `json:"expiration"`
+	} `json:"refresh_token"`
 }
 
 type Chirp struct {
-	Id   int    `json:"id"`
-	Body string `json:"body"`
+	Id       int    `json:"id"`
+	Body     string `json:"body"`
+	AuthorId int    `json:"author_id"`
 }
 
 type DB struct {
@@ -76,13 +89,13 @@ func (db *DB) writeDB(dbStructure DBStructure) error {
 	return nil
 }
 
-func (db *DB) CreateChirp(body string) (Chirp, error) {
+func (db *DB) CreateChirp(body string, author int) (Chirp, error) {
 	data, err := db.loadDB()
 	if err != nil {
 		return Chirp{}, err
 	}
 	nextId := len(data.Chirps) + 1
-	c := Chirp{Id: nextId, Body: body}
+	c := Chirp{Id: nextId, Body: body, AuthorId: author}
 	data.Chirps[nextId] = c
 
 	err = db.writeDB(data)
@@ -116,13 +129,22 @@ func (db *DB) GetChirp(id int) (Chirp, error) {
 	return chirp, nil
 }
 
-func (db *DB) CreateUser(email string) (User, error) {
+func (db *DB) CreateUser(email string, password string) (User, error) {
 	data, err := db.loadDB()
 	if err != nil {
 		return User{}, err
 	}
+	for _, user := range data.Users {
+		if user.Email == email {
+			return User{}, fmt.Errorf("user with email %s already exists", email)
+		}
+	}
 	nextId := len(data.Users) + 1
-	u := User{Id: nextId, Email: email}
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return User{}, err
+	}
+	u := User{Id: nextId, Email: email, Password: string(hashedPassword)}
 	data.Users[nextId] = u
 
 	err = db.writeDB(data)
@@ -130,4 +152,156 @@ func (db *DB) CreateUser(email string) (User, error) {
 		return User{}, err
 	}
 	return u, nil
+}
+
+func (db *DB) GetUserByEmail(email string) (User, error) {
+	data, err := db.loadDB()
+	if err != nil {
+		return User{}, err
+	}
+
+	for _, user := range data.Users {
+		if user.Email == email {
+			return user, nil
+		}
+	}
+
+	return User{}, errors.New("cannot find user")
+}
+
+func (db *DB) GetUserByID(id int) (User, error) {
+	data, err := db.loadDB()
+	if err != nil {
+		return User{}, err
+	}
+
+	user, ok := data.Users[id]
+	if !ok {
+		return User{}, errors.New("cannot find user")
+	}
+
+	return user, nil
+}
+
+func (db *DB) GetUserByToken(token string) (User, error) {
+	data, err := db.loadDB()
+	if err != nil {
+		return User{}, err
+	}
+
+	for _, user := range data.Users {
+		if user.RefreshToken.Token == token {
+			if time.Now().Before(user.RefreshToken.Expiration) {
+				return user, nil
+			}
+			return User{}, errors.New("token expired")
+		}
+	}
+	return User{}, errors.New("updateuser: user doesn't exist with token")
+}
+
+func (db *DB) UpdateUser(id int, email string, password string) (User, error) {
+	data, err := db.loadDB()
+	if err != nil {
+		return User{}, err
+	}
+	user, ok := data.Users[id]
+	if !ok {
+		return User{}, fmt.Errorf("updateuser: user doesn't exist with id %d", id)
+	}
+
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return User{}, err
+	}
+
+	user.Email = email
+	user.Password = string(hashedPassword)
+
+	data.Users[id] = user
+
+	if err := db.writeDB(data); err != nil {
+		return User{}, err
+	}
+	return data.Users[id], nil
+}
+
+func (db *DB) CreateRefreshToken(userId int) (string, error) {
+	data, err := db.loadDB()
+	if err != nil {
+		return "", err
+	}
+	user, ok := data.Users[userId]
+	if !ok {
+		return "", errors.New("cannot find user")
+	}
+
+	newToken := make([]byte, 32)
+	if _, err = rand.Read(newToken); err != nil {
+		return "", err
+	}
+
+	newTokenString := hex.EncodeToString(newToken)
+	user.RefreshToken.Token = newTokenString
+	user.RefreshToken.Expiration = time.Now().Add(time.Hour)
+
+	data.Users[user.Id] = user
+	err = db.writeDB(data)
+	if err != nil {
+		return "", err
+	}
+	return newTokenString, nil
+}
+
+func (db *DB) RevokeRefreshToken(token string) error {
+	data, err := db.loadDB()
+	if err != nil {
+		return err
+	}
+	for _, user := range data.Users {
+		if user.RefreshToken.Token == token {
+			user.RefreshToken.Token = ""
+			user.RefreshToken.Expiration = time.Time{}
+			data.Users[user.Id] = user
+			if err := db.writeDB(data); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (db *DB) DeleteChirp(chirpID int) error {
+	data, err := db.loadDB()
+	if err != nil {
+		return err
+	}
+	_, ok := data.Chirps[chirpID]
+	if !ok {
+		return errors.New("chirp doesn't exist")
+	}
+
+	delete(data.Chirps, chirpID)
+
+	if err := db.writeDB(data); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (db *DB) UpdateUserChirpyRed(userId int, sub bool) error {
+	data, err := db.loadDB()
+	if err != nil {
+		return err
+	}
+	user, ok := data.Users[userId]
+	if !ok {
+		return errors.New("user doesn't exist")
+	}
+	user.IsChirpyRed = sub
+	data.Users[user.Id] = user
+	if err := db.writeDB(data); err != nil {
+		return err
+	}
+	return nil
 }

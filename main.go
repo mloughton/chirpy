@@ -12,12 +12,19 @@ import (
 	"strconv"
 	"strings"
 	"text/template"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/joho/godotenv"
 
 	"github.com/mloughton/chirpy/internal/database"
+	"golang.org/x/crypto/bcrypt"
 )
 
 type apiConfig struct {
 	db             *database.DB
+	jwtSecret      string
+	polkaAPIKey    string
 	fileserverHits int
 }
 
@@ -94,6 +101,12 @@ func Clean(s string) string {
 }
 
 func (cfg *apiConfig) HandlePostChirps(w http.ResponseWriter, r *http.Request) {
+	token := cfg.GetToken(r)
+	if token == nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
 	type request struct {
 		Body string `json:"body"`
 	}
@@ -111,7 +124,21 @@ func (cfg *apiConfig) HandlePostChirps(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := cfg.db.CreateChirp(Clean(req.Body))
+	idString, err := token.Claims.GetSubject()
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	id, err := strconv.Atoi(idString)
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	res, err := cfg.db.CreateChirp(Clean(req.Body), id)
 	if err != nil {
 		log.Println(err)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -152,29 +179,295 @@ func (cfg *apiConfig) HandleGetChirp(w http.ResponseWriter, r *http.Request) {
 }
 
 func (cfg *apiConfig) HandlePostUsers(w http.ResponseWriter, r *http.Request) {
-	type request struct {
-		Email string `json:"email"`
+	var req struct {
+		Password string `json:"password"`
+		Email    string `json:"email"`
 	}
-	decoder := json.NewDecoder(r.Body)
-	req := request{}
-	err := decoder.Decode(&req)
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	user, err := cfg.db.CreateUser(req.Email, req.Password)
 	if err != nil {
 		log.Println(err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	res, err := cfg.db.CreateUser(req.Email)
-	if err != nil {
-		log.Println(err)
-		w.WriteHeader(http.StatusInternalServerError)
-		return
+	res := struct {
+		Id          int    `json:"id"`
+		Email       string `json:"email"`
+		IsChirpyRed bool   `json:"is_chirpy_red"`
+	}{
+		Id:          user.Id,
+		Email:       user.Email,
+		IsChirpyRed: user.IsChirpyRed,
 	}
 
 	respondWithJSON(w, http.StatusCreated, res)
 }
 
+func (cfg *apiConfig) HandlePostLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Password string `json:"password"`
+		Email    string `json:"email"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	user, err := cfg.db.GetUserByEmail(req.Email)
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(req.Password)); err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	signedJWTToken, err := cfg.GenerateJWTToken(user)
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	refreshToken, err := cfg.db.CreateRefreshToken(user.Id)
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	res := struct {
+		Id           int    `json:"id"`
+		Email        string `json:"email"`
+		IsChirpyRed  bool   `json:"is_chirpy_red"`
+		Token        string `json:"token"`
+		RefreshToken string `json:"refresh_token"`
+	}{
+		Id:           user.Id,
+		Email:        user.Email,
+		IsChirpyRed:  user.IsChirpyRed,
+		Token:        signedJWTToken,
+		RefreshToken: refreshToken,
+	}
+
+	respondWithJSON(w, http.StatusOK, res)
+
+}
+
+func (cfg *apiConfig) HandlePutUsers(w http.ResponseWriter, r *http.Request) {
+	token := cfg.GetToken(r)
+
+	if token == nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	idString, err := token.Claims.GetSubject()
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	id, err := strconv.Atoi(idString)
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	var req struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	user, err := cfg.db.UpdateUser(id, req.Email, req.Password)
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	res := struct {
+		Id          int    `json:"id"`
+		Email       string `json:"email"`
+		IsChirpyRed bool   `json:"is_chirpy_red"`
+	}{
+		Id:          user.Id,
+		Email:       user.Email,
+		IsChirpyRed: user.IsChirpyRed,
+	}
+	respondWithJSON(w, http.StatusOK, res)
+}
+
+func (cfg *apiConfig) GenerateJWTToken(user database.User) (string, error) {
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
+		Issuer:    "chirpy",
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Second * 3600)),
+		Subject:   fmt.Sprint(user.Id),
+	})
+
+	signedToken, err := token.SignedString([]byte(cfg.jwtSecret))
+	if err != nil {
+		return "", err
+	}
+
+	return signedToken, err
+}
+
+func (cfg *apiConfig) HandlePostRefresh(w http.ResponseWriter, r *http.Request) {
+	tokenString := r.Header.Get("Authorization")[7:]
+	user, err := cfg.db.GetUserByToken(tokenString)
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	newToken, err := cfg.GenerateJWTToken(user)
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	res := struct {
+		Token string `json:"token"`
+	}{
+		Token: newToken,
+	}
+	respondWithJSON(w, http.StatusOK, res)
+}
+
+func (cfg *apiConfig) HandlePostRevoke(w http.ResponseWriter, r *http.Request) {
+	tokenString := r.Header.Get("Authorization")[7:]
+	if err := cfg.db.RevokeRefreshToken(tokenString); err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (cfg *apiConfig) GetToken(r *http.Request) *jwt.Token {
+	tokenString := r.Header.Get("Authorization")[7:]
+	token, err := jwt.ParseWithClaims(tokenString, &jwt.RegisteredClaims{}, func(token *jwt.Token) (interface{}, error) {
+		return []byte(cfg.jwtSecret), nil
+	})
+
+	if err != nil {
+		return nil
+	}
+	return token
+}
+
+func (cfg *apiConfig) HandleDeleteChirp(w http.ResponseWriter, r *http.Request) {
+	token := cfg.GetToken(r)
+	if token == nil {
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+	chirpId, err := strconv.Atoi(r.PathValue("chirpId"))
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	chirp, err := cfg.db.GetChirp(chirpId)
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	idString, err := token.Claims.GetSubject()
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	userID, err := strconv.Atoi(idString)
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	if chirp.AuthorId != userID {
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+
+	if err := cfg.db.DeleteChirp(chirpId); err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (cfg *apiConfig) HandlePostPolkaWebhook(w http.ResponseWriter, r *http.Request) {
+	authHeader := r.Header.Get("Authorization")
+	if !strings.Contains(authHeader, "ApiKey ") {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	if authHeader[7:] != cfg.polkaAPIKey {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	var req struct {
+		Event string `json:"event"`
+		Data  struct {
+			UserId int `json:"user_id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	if req.Event != "user.upgraded" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	user, err := cfg.db.GetUserByID(req.Data.UserId)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	if !user.IsChirpyRed {
+		if err := cfg.db.UpdateUserChirpyRed(req.Data.UserId, true); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func main() {
+
+	godotenv.Load()
 
 	dbg := flag.Bool("debug", false, "Enable debug mode")
 	flag.Parse()
@@ -188,7 +481,12 @@ func main() {
 		log.Println(err)
 		return
 	}
-	apiCfg := &apiConfig{db: db}
+
+	apiCfg := &apiConfig{
+		db:          db,
+		jwtSecret:   os.Getenv("JWT_SECRET"),
+		polkaAPIKey: os.Getenv("POLKA_API_KEY"),
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/app/*", apiCfg.middlewareMetricsInc(appHandler()))
@@ -209,9 +507,21 @@ func main() {
 
 	mux.HandleFunc("GET /api/chirps/{chirpId}", apiCfg.HandleGetChirp)
 
+	mux.HandleFunc("DELETE /api/chirps/{chirpId}", apiCfg.HandleDeleteChirp)
+
 	mux.HandleFunc("POST /api/users", apiCfg.HandlePostUsers)
 
+	mux.HandleFunc("POST /api/login", apiCfg.HandlePostLogin)
+
+	mux.HandleFunc("PUT /api/users", apiCfg.HandlePutUsers)
+
+	mux.HandleFunc("POST /api/refresh", apiCfg.HandlePostRefresh)
+
+	mux.HandleFunc("POST /api/revoke", apiCfg.HandlePostRevoke)
+
 	mux.HandleFunc("GET /admin/metrics/", apiCfg.HandleGetAdminMetrics)
+
+	mux.HandleFunc("POST /api/polka/webhooks", apiCfg.HandlePostPolkaWebhook)
 
 	server := &http.Server{
 		Handler: mux,
