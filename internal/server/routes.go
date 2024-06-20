@@ -177,15 +177,47 @@ func (s *Server) HandlePostChirps(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) HandleGetChirps(w http.ResponseWriter, r *http.Request) {
-	chirps, err := s.db.GetChirps()
-	if err != nil {
-		log.Println(err)
-		w.WriteHeader(http.StatusInternalServerError)
+	authorIdParam := r.URL.Query().Get("author_id")
+	chirps := []database.Chirp{}
+	if authorIdParam == "" {
+		allChirps, err := s.db.GetChirps()
+		if err != nil {
+			log.Println(err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		chirps = allChirps
+	} else {
+		authorId, err := strconv.Atoi(authorIdParam)
+		if err != nil {
+			log.Println(err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		authorChirps, err := s.db.GetChirpsByAuthorID(authorId)
+		if err != nil {
+			log.Println(err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		chirps = authorChirps
+	}
+	sortParam := r.URL.Query().Get("sort")
+	var sortFunc func(int, int) bool
+	switch sortParam {
+	case "", "asc":
+		sortFunc = func(i, j int) bool {
+			return chirps[i].Id < chirps[j].Id
+		}
+	case "desc":
+		sortFunc = func(i, j int) bool {
+			return chirps[i].Id > chirps[j].Id
+		}
+	default:
+		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	sort.Slice(chirps, func(i, j int) bool {
-		return chirps[i].Id < chirps[j].Id
-	})
+	sort.Slice(chirps, sortFunc)
 	respondWithJSON(w, http.StatusOK, chirps)
 }
 
